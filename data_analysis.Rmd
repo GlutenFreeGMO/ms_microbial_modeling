@@ -1,0 +1,474 @@
+---
+title: "growth_curve_annotation"
+author: "mc"
+date: "2023-06-27"
+output: html_document
+
+knitr::opts_knit$set(root.dir = 'D:/Projects/cornell_ms_thesis/data/growth_curves/clean_data/annotated_data')
+---
+
+```{r setup, echo=TRUE, results='hide'}
+
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(growthcurver)
+library(purrr)
+library(minpack.lm)
+library(tidyr)
+
+```
+
+Logistic Model
+N(t) = K / (1 + exp(-r *(t-t0)))
+
+N(t)  - OD600 at time t
+K     - carrying capacity (maximum OD600)
+r     - growth rate
+t0    - inflection point (time of maximum r)
+
+Four Parameter Model
+N(t) = A + ((B - A) / (1 + exp((t - C) / D)))
+
+N(t)  - OD600 at time t
+A     - lower asymptote, representing the initial value when t is very small
+B     - upper asymptote, representing the final value when t is very large
+C     - inflection point, which is the time of maximum growth rate
+D     - related to the growth rate at the inflection point.
+
+```{r functions, echo=TRUE, results='hide'}
+
+#function that calculates 95% confidence intervals 
+#for the given data vector using a t-distribution
+conf_int95 <- function(data) {
+  n <- length(data)
+  error <- qt(0.975, df=n-1) * sd(data)/sqrt(n)
+  return(error)
+  }
+
+#log-logistic model
+logistic_model <- function(t, K, r, t0) {
+  K / (1 + exp(-r*(t-t0)))
+  }
+
+#biphasic model, using double-logistic
+biphasic_model <- function(t, K1, r1, t01, K2, r2, t02) {
+  logistic_model(t, K1, r1, t01) + logistic_model(t, K2, r2, t02)
+  }
+
+#gompertz model
+gompertz_model <- function(t, N0, umax, lambda) {
+  N0 * exp(-exp((umax/exp(1)) * (lambda-t) + 1))
+  }
+
+```
+
+```{r analysis, echo=TRUE, results='hide'}
+
+annotated <- read.csv("all_annotated.csv") #read .csv data file
+
+#combining read-data chunk and summary-stats into one
+#%>% is the magrittr pipe operator, |> is the native Rstudio pipe
+stats <- annotated |> 
+  group_by(pH, Strain, Time) |> 
+  summarise(N=length(OD600), 
+            AverageOD=mean(OD600), 
+            StDev=sd(OD600), 
+            CI95=conf_int95(OD600)) |> 
+  filter(!is.na(Strain))
+
+```
+
+```{r gg-plot, echo=TRUE}
+
+graph_1 <- ggplot(data=stats, aes(x=Time/60, y=AverageOD, color=Strain)) + 
+        geom_ribbon(aes(ymin=AverageOD-StDev, ymax=AverageOD+StDev, fill=Strain), color=NA, alpha=0.3) + #standard deviation
+        #geom_ribbon(aes(ymin=AverageOD-CI95, ymax=AverageOD+CI95, fill=Strain), color=NA, alpha=0.3) + #95% confidence interval
+        geom_line() + 
+        #scale_y_log10() + 
+        facet_grid(vars(Strain), vars(pH)) + 
+        labs(x="Time (Hours)", y="Absorbance at 600 nm")
+
+print(graph_1)
+
+```
+
+```{r all-models, echo=TRUE}
+#log-logisitc fit
+fit_log <- stats |> 
+  group_by(Strain, pH) |> 
+  do(fit = tryCatch(
+    nlsLM(AverageOD ~ logistic_model(Time, K, r, t0), 
+                 start = list(K = max(.$AverageOD, na.rm = TRUE), 
+                              r = 0.1, 
+                              t0 = max(.$Time, na.rm = TRUE)/2), 
+          data = ., 
+          control = nls.control(maxiter = 200)), 
+    error = function(e) {
+      message("Failed to fit model for ", .$Strain[1], " ", .$pH[1], ": ", e$message) 
+      return(NULL)
+      }
+    ))
+
+#biphasic fit
+fit_biphasic <- stats |> 
+  group_by(Strain, pH) |> 
+  do(fit = tryCatch(
+    nlsLM(AverageOD ~ biphasic_model(Time, K1, r1, t01, K2, r2, t02), 
+          start = list(K1 = max(.$AverageOD, na.rm = TRUE)/2, 
+                       r1 = 0.1, 
+                       t01 = max(.$Time, na.rm = TRUE)/4, 
+                       K2 = max(.$AverageOD, na.rm = TRUE)/2, 
+                       r2 = 0.1, 
+                       t02 = 3 * max(.$Time, na.rm = TRUE)/4), 
+          data = ., 
+          control = nls.control(maxiter = 200)),
+    error = function(e) {
+      message("Failed to fit model for ", .$Strain[1], " ", .$pH[1], ": ", e$message) 
+      return(NULL)
+      }
+    ))
+
+#gompertz fit
+fit_gompertz <- stats |> 
+  group_by(Strain, pH) |> 
+  do(fit = tryCatch(
+    nlsLM(AverageOD ~ gompertz_model(Time, N0, umax, lambda), 
+          start = list(N0 = max(.$AverageOD, na.rm = TRUE), 
+                       umax = 0.1, 
+                       lambda = max(.$Time, na.rm = TRUE)/2), 
+          data = ., 
+          control = nls.control(maxiter = 200)),
+    error = function(e) {
+      message("Failed to fit model for ", .$Strain[1], " ", .$pH[1], ": ", e$message) 
+      return(NULL)
+      }
+    ))
+
+```
+
+```{r all-predictions, echo=TRUE}
+
+#generate time sequence predictions
+#length.out = 240 indicates points every 12 minutes
+#length.our = 144 indicates points every 20 minutes
+time_s.pred <- seq(from = min(stats$Time, na.rm = TRUE), to = max(stats$Time, na.rm = TRUE), length.out = 576)
+
+#generate predictions for the logistic model
+predictions_logistic <- do.call(rbind, lapply(seq_len(nrow(fit_log)), function(i) {
+  params <- coef(fit_log$fit[[i]]) 
+  preds <- data.frame(
+    Time = time_s.pred, 
+    AverageOD = logistic_model(time_s.pred, params["K"], params["r"], params["t0"]), 
+    Strain = fit_log$Strain[i], 
+    pH = fit_log$pH[i], 
+    Model = "Logistic"
+    ) 
+  return(preds)
+  }))
+
+#generate predictions for the biphasic model
+predictions_biphasic <- do.call(rbind, lapply(seq_len(nrow(fit_biphasic)), function(i) {
+  params <- coef(fit_biphasic$fit[[i]])
+  preds <- data.frame(
+    Time = time_s.pred, 
+    AverageOD = biphasic_model(time_s.pred, params["K1"], params["r1"], params["t01"], params["K2"], params["r2"], params["t02"]), 
+    Strain = fit_biphasic$Strain[i], 
+    pH = fit_biphasic$pH[i], 
+    Model = "Biphasic"
+    ) 
+  return(preds)
+  }))
+
+#generate predictions for the gompertz model
+predictions_gompertz <- do.call(rbind, lapply(seq_len(nrow(fit_gompertz)), function(i) {
+  params <- coef(fit_gompertz$fit[[i]]) 
+  preds <- data.frame(
+    Time = time_s.pred, 
+    AverageOD = gompertz_model(time_s.pred, params["N0"], params["umax"], params["lambda"]), 
+    Strain = fit_gompertz$Strain[i], 
+    pH = fit_gompertz$pH[i], 
+    Model = "Gompertz"
+    ) 
+  return(preds)
+  }))
+
+#combine the three sets of predictions
+predictions <- rbind(predictions_logistic, predictions_biphasic, predictions_gompertz)
+
+```
+
+```{r all-graphs, echo=TRUE}
+
+graph_a <- ggplot() + 
+  geom_point(data = stats, aes(x = Time, y = AverageOD, color = )) + 
+  geom_line(data = predictions, aes(x = Time, y = AverageOD, color = Model)) + 
+  facet_grid(Strain ~ pH) + 
+  theme_bw() + 
+  labs(x = "Time", y = "OD600", color = "Model")
+
+print(graph_a)
+
+```
+
+```{r stats-functions, echo=TRUE}
+
+#compute lag-time
+lag_time <- function(fit, model_type) {
+  coef <- coef(fit) 
+  switch(model_type,
+         "logistic" = {log(2) / coef['r']},
+         "biphasic" = {min(log(2)/coef['r1'], log(2)/coef['r2'])},
+         "gompertz" = {coef['lambda']}
+  )/60
+  }
+
+#compute growth rate
+growth_rate <- function(fit, model_type) {
+  coef <- coef(fit) 
+  switch(model_type, 
+         "logistic" = {coef['K']}, 
+         "biphasic" = {max(coef['K1'], coef['K2'])}, 
+         "gompertz" = {coef['umax']}
+  )
+  }
+
+
+#compute initial OD value (y0)
+initial_od <- function(fit, model_type) {
+  coef <- coef(fit) 
+  switch(model_type, 
+         "logistic" = {coef['K'] / (1 + exp(coef['r']*coef['t0']))}, 
+         "biphasic" = {coef['K1'] / (1 + exp(coef['r1']*coef['t01'])) + coef['K2'] / (1 + exp(coef['r2']*coef['t02']))}, 
+         "gompertz" = {coef['N0'] * exp(-exp((coef['umax']/exp(1)) * (coef['lambda']) + 1))}
+  )
+  }
+
+#compute C value (increase in absorbance from y0 to ymax)
+compute_c <- function(fit, model_type) {
+  coef <- coef(fit) 
+  switch(model_type, 
+         "logistic" = {coef['K'] - initial_od(fit, model_type)}, 
+         "biphasic" = {max(coef['K1'], coef['K2']) - initial_od(fit, model_type)}, 
+         "gompertz" = {coef['N0'] * exp(coef['umax'] * (coef['lambda'] - 1/exp(1))) - initial_od(fit, model_type)}
+  )
+  }
+
+#compute ymax
+ymax <- function(fit, model_type) {
+  coef <- coef(fit) 
+  switch(model_type, 
+         "logistic" = {coef['K']}, 
+         "biphasic" = {max(coef['K1'], coef['K2'])}, 
+         "gompertz" = {coef['N0'] * exp(-exp((coef['umax']/exp(1)) * (coef['lambda']) + 1))}
+  )
+  }
+
+#compute sse
+compute_sse <- function(fit) {
+  residuals <- resid(fit)
+  sse <- sum(residuals^2)
+  return(sse)
+  }
+
+#compute r^2
+compute_r2 <- function(fit, data) {
+  residuals <- resid(fit) 
+  sse <- sum(residuals^2) 
+  sst <- sum((data$AverageOD - mean(data$AverageOD))^2) 
+  r_squared <- 1 - sse/sst 
+  return(r_squared)
+  }
+
+#compute rmse
+compute_rmse <- function(fit) {
+  residuals <- resid(fit) 
+  rmse <- sqrt(mean(residuals^2))
+  return(rmse)
+  }
+
+```
+
+```{r stats-apply, echo=TRUE}
+
+#compute statistics for each model
+
+#logistic
+summary_log <- fit_log |>
+  rowwise() |> 
+  mutate(lag_time = lag_time(fit, "logistic"), 
+         growth_rate = growth_rate(fit, "logistic"), 
+         initial_od = initial_od(fit, "logistic"), 
+         c_value = compute_c(fit, "logistic"), 
+         ymax = ymax(fit, "logistic"), 
+         SSE = compute_sse(fit), 
+         Rsquared = compute_r2(fit, data = stats), 
+         RMSE = compute_rmse(fit))
+
+#biphasic
+summary_biphasic <- fit_biphasic |> 
+  rowwise() |> 
+  mutate(lag_time = lag_time(fit, "biphasic"), 
+         growth_rate = growth_rate(fit, "biphasic"), 
+         initial_od = initial_od(fit, "biphasic"), 
+         c_value = compute_c(fit, "biphasic"), 
+         ymax = ymax(fit, "biphasic"), 
+         SSE = compute_sse(fit), 
+         Rsquared = compute_r2(fit, data = stats), 
+         RMSE = compute_rmse(fit))
+
+#gompertz
+summary_gompertz <- fit_gompertz |> 
+  rowwise() |> 
+  mutate(lag_time = lag_time(fit, "gompertz"), 
+         growth_rate = growth_rate(fit, "gompertz"), 
+         initial_od = initial_od(fit, "gompertz"), 
+         c_value = compute_c(fit, "gompertz"), 
+         ymax = ymax(fit, "gompertz"), 
+         SSE = compute_sse(fit), 
+         Rsquared = compute_r2(fit, data = stats), 
+         RMSE = compute_rmse(fit))
+
+summary_log$model <- "logistic"
+summary_biphasic$model <- "biphasic"
+summary_gompertz$model <- "gompertz"
+
+# combine all model statistics
+summary_all <- rbind(summary_log, summary_biphasic, summary_gompertz)
+
+```
+
+```{r model-decide, echo=TRUE}
+
+best_model <- summary_all |>
+  group_by(pH, Strain) |>
+  summarise(
+    best_RMSE_model = model[which.min(RMSE)],
+    min_RMSE = min(RMSE),
+    best_Rsquared_model = model[which.max(Rsquared)],
+    max_Rsquared = max(Rsquared)
+    )
+
+```
+
+
+
+```{r stats-apply, echo=TRUE}
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+From here we select models we want to use for specific quadrants
+```{r log-modeling, echo=TRUE}
+
+subset_log <- stats |> 
+  filter(
+      (pH == 4.6) | 
+      (Strain == "9" & pH %in% c(5.8, 6.1)) | 
+      (Strain == "B-768" & pH != 7.2) | 
+      (Strain == "NRS-609" & pH %in% c(4.9, 5.5))
+      )
+
+fit_log <- subset_log |> 
+  group_by(Strain, pH) |> 
+  do(fit = nlsLM(AverageOD ~ logistic_model(Time, K, r, t0), 
+                 start = list(K = max(.$AverageOD, na.rm = TRUE), r = 0.1, t0 = max(.$Time, na.rm = TRUE)/2), 
+                 data = .)
+     )
+
+```
+
+```{r biphasic-modeling, echo=TRUE}
+
+subset_biphasic <- stats |> 
+  filter(
+      (Strain == "9" & pH %in% c(7.2, 5.2, 4.9)) | 
+      (Strain == "11" & !(pH %in% c(4.6, 6.4, 7.2))) | 
+      (Strain == "15" & pH %in% c(4.9, 5.2, 5.5)) | 
+      (Strain == "16" & pH %in% c(5.8, 5.5, 5.2, 4.9)) | 
+      (Strain == "NRS-609" & !(pH %in% c(7.2, 5.5, 4.6, 4.9)))
+      )
+
+
+fit_biphasic <- subset_biphasic |> 
+  group_by(Strain, pH) |> 
+  do(fit = nlsLM(AverageOD ~ biphasic_model(Time, K1, r1, t01, K2, r2, t02), 
+                 start = list(K1 = max(.$AverageOD, na.rm = TRUE)/2, r1 = 0.1, t01 = max(.$Time, na.rm = TRUE)/4,
+                              K2 = max(.$AverageOD, na.rm = TRUE)/2, r2 = 0.1, t02 = 3*max(.$Time, na.rm = TRUE)/4), 
+                 data = ., control = nls.control(maxiter = 100))
+     )
+
+```
+
+```{r predictions-model, echo=TRUE}
+
+#generate time sequence predictions
+#length.out = 240 indicates points every 12 minutes
+#length.our = 144 indicates points every 20 minutes
+time_s.pred <- seq(from = min(stats$Time, na.rm = TRUE), to = max(stats$Time, na.rm = TRUE), length.out = 576)
+
+#generate predictions for the logistic model
+predictions_logistic <- do.call(rbind, lapply(seq_len(nrow(fit_log)), function(i) {
+  params <- coef(fit_log$fit[[i]]) 
+  preds <- data.frame(
+    Time = time_s.pred, 
+    AverageOD = logistic_model(time_s.pred, params["K"], params["r"], params["t0"]), 
+    Strain = fit_log$Strain[i], 
+    pH = fit_log$pH[i], 
+    Model = "Logistic"
+    ) 
+  return(preds)
+  }))
+
+#generate predictions for the biphasic model
+predictions_biphasic <- do.call(rbind, lapply(seq_len(nrow(fit_biphasic)), function(i) {
+  params <- coef(fit_biphasic$fit[[i]])
+  preds <- data.frame(
+    Time = time_s.pred, 
+    AverageOD = biphasic_model(time_s.pred, params["K1"], params["r1"], params["t01"], params["K2"], params["r2"], params["t02"]), 
+    Strain = fit_biphasic$Strain[i], 
+    pH = fit_biphasic$pH[i], 
+    Model = "Biphasic"
+    ) 
+  return(preds)
+  }))
+
+#combine the two sets of predictions
+predictions <- rbind(predictions_logistic, predictions_biphasic)
+
+```
+
+```{r graphing-model, echo=TRUE}
+
+graph_l <- ggplot() + 
+  geom_point(data = stats, aes(x = Time, y = AverageOD, color = )) + 
+  geom_line(data = predictions, aes(x = Time, y = AverageOD, color = Model)) + 
+  facet_grid(Strain ~ pH) + 
+  theme_bw() + 
+  labs(x = "Time", y = "OD600", color = "Model")
+
+print(graph_l)
+
+```
+
+
+
+
+
+
+
+
+
+
